@@ -6,6 +6,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -22,10 +24,9 @@ type Notification struct {
 type Hub struct {
 	mu            sync.Mutex
 	notifications []Notification
-	stdinWriter  io.Writer // writes to Claude's stdin (PTY master or pipe)
-	nudgeMessage string
-	startedAt    time.Time // suppress nudges during startup grace period
-	gracePeriod  time.Duration
+	stdinWriter   io.Writer // writes to Claude's stdin (PTY master or pipe)
+	startedAt     time.Time // suppress nudges during startup grace period
+	gracePeriod   time.Duration
 }
 
 // New creates a hub that injects nudge messages into the given writer.
@@ -33,10 +34,9 @@ type Hub struct {
 // initial sync without flooding the client with startup notifications.
 func New(stdinWriter io.Writer) *Hub {
 	return &Hub{
-		stdinWriter:  stdinWriter,
-		nudgeMessage: "[mcp-notify] You have new notifications. Call the get_notifications tool to see them.",
-		startedAt:    time.Now(),
-		gracePeriod:  3 * time.Second,
+		stdinWriter: stdinWriter,
+		startedAt:   time.Now(),
+		gracePeriod: 3 * time.Second,
 	}
 }
 
@@ -121,6 +121,31 @@ func (h *Hub) handleNotify(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "ok")
 }
 
+// summaryMessage builds a notification message with source counts.
+// Must be called with h.mu held.
+func (h *Hub) summaryMessage() string {
+	counts := make(map[string]int)
+	for _, n := range h.notifications {
+		counts[n.Server]++
+	}
+	total := len(h.notifications)
+
+	// Sort server names for deterministic output.
+	servers := make([]string, 0, len(counts))
+	for s := range counts {
+		servers = append(servers, s)
+	}
+	sort.Strings(servers)
+
+	var parts []string
+	for _, s := range servers {
+		parts = append(parts, fmt.Sprintf("%s: %d", s, counts[s]))
+	}
+
+	return fmt.Sprintf("[mcp-notify] %d new notification(s) (%s). Call the get_notifications tool to see them.",
+		total, strings.Join(parts, ", "))
+}
+
 // nudge simulates typing a message into Claude's stdin character by character.
 // Bulk writes to the PTY master are ignored by the TUI, but character-by-character
 // delivery (like real keyboard input) is accepted even during processing.
@@ -128,9 +153,12 @@ func (h *Hub) nudge() {
 	if h.stdinWriter == nil {
 		return
 	}
+	h.mu.Lock()
+	msg := h.summaryMessage()
+	h.mu.Unlock()
 	go func() {
-		msg := h.nudgeMessage + "\r"
-		for _, c := range []byte(msg) {
+		full := msg + "\r"
+		for _, c := range []byte(full) {
 			_, err := h.stdinWriter.Write([]byte{c})
 			if err != nil {
 				log.Printf("nudge stdin: %v", err)
@@ -155,14 +183,21 @@ func (h *Hub) handleStopHook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	count := h.Count()
+	h.mu.Lock()
+	count := len(h.notifications)
+	var msg string
+	if count > 0 {
+		msg = h.summaryMessage()
+	}
+	h.mu.Unlock()
+
 	w.Header().Set("Content-Type", "application/json")
 
 	if count > 0 {
 		log.Printf("stop hook: blocking — %d pending notifications", count)
 		out, _ := json.Marshal(map[string]any{
 			"decision": "block",
-			"reason":   fmt.Sprintf("[mcp-notify] You have %d new notifications. Call the get_notifications tool to see them.", count),
+			"reason":   msg,
 		})
 		w.Write(out)
 		return
