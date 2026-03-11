@@ -46,6 +46,7 @@ type processManager struct {
 	restartMessage string
 	hub            *hub.Hub
 	skipPerms      bool // pass --dangerously-skip-permissions
+	stdinStarted   bool // ensures stdin reader goroutine starts only once
 }
 
 func newProcessManager(mcpConfig string, baseArgs []string, h *hub.Hub, skipPerms bool) *processManager {
@@ -97,11 +98,16 @@ func (pm *processManager) startClaude() error {
 	if err != nil {
 		return fmt.Errorf("open pty: %w", err)
 	}
-	if _, err := term.MakeRaw(int(pts.Fd())); err != nil {
-		pts.Close()
-		ptmx.Close()
-		return fmt.Errorf("set pty raw mode: %w", err)
+
+	// Propagate outer terminal size to inner PTY so Claude's TUI renders correctly.
+	// Without this, the inner PTY defaults to 80x24 which breaks Claude's layout,
+	// especially in Docker where the PTY chain is longer.
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		if sz, err := pty.GetsizeFull(os.Stdin); err == nil {
+			_ = pty.Setsize(ptmx, sz)
+		}
 	}
+
 	cmd.Stdin = pts
 
 	if err := cmd.Start(); err != nil {
@@ -119,28 +125,41 @@ func (pm *processManager) startClaude() error {
 	safeWriter := &syncWriter{w: ptmx, mu: pm.stdinMu}
 	pm.hub.SetWriter(safeWriter)
 
-	// Forward terminal stdin → PTY master.
-	go func() {
-		if msg != "" {
+	// Inject restart message after delay if needed.
+	if msg != "" {
+		go func() {
 			time.Sleep(5 * time.Second)
 			log.Printf("injecting restart message (%d bytes)", len(msg))
 			pm.stdinMu.Lock()
 			ptmx.Write([]byte(msg + "\r"))
 			pm.stdinMu.Unlock()
-		}
-		buf := make([]byte, 4096)
-		for {
-			n, err := os.Stdin.Read(buf)
-			if n > 0 {
-				pm.stdinMu.Lock()
-				ptmx.Write(buf[:n])
-				pm.stdinMu.Unlock()
+		}()
+	}
+
+	// Start a single persistent stdin reader goroutine (only once).
+	// On restart, only the PTY target (pm.ptmx) changes — the reader
+	// always writes to the current PTY via pm.stdinMu + pm.ptmx.
+	// This avoids the double-read race where old and new goroutines
+	// both call os.Stdin.Read() simultaneously, losing bytes.
+	if !pm.stdinStarted {
+		pm.stdinStarted = true
+		go func() {
+			buf := make([]byte, 4096)
+			for {
+				n, err := os.Stdin.Read(buf)
+				if n > 0 {
+					pm.stdinMu.Lock()
+					if pm.ptmx != nil {
+						pm.ptmx.Write(buf[:n])
+					}
+					pm.stdinMu.Unlock()
+				}
+				if err != nil {
+					return
+				}
 			}
-			if err != nil {
-				return
-			}
-		}
-	}()
+		}()
+	}
 
 	// Monitor process exit.
 	go func() {
@@ -535,6 +554,20 @@ func main() {
 	log.Printf("hub listening on %s", httpServer.Addr)
 	go httpServer.Serve(ln)
 
+	// Set the real terminal to raw mode so keystrokes pass through
+	// transparently to Claude's PTY. Without this, the outer terminal
+	// does its own line buffering and Enter key translation, which
+	// breaks Claude's TUI (especially in Docker where there's a double
+	// PTY layer).
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+		if err != nil {
+			log.Printf("warning: failed to set raw mode on stdin: %v", err)
+		} else {
+			defer term.Restore(int(os.Stdin.Fd()), oldState)
+		}
+	}
+
 	// Start Claude.
 	if err := pm.startClaude(); err != nil {
 		log.Fatalf("initial start: %v", err)
@@ -543,6 +576,22 @@ func main() {
 	// Main loop: wait for exit or signal, support restart.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+
+	// Propagate terminal resize (SIGWINCH) from outer terminal to inner PTY.
+	winchCh := make(chan os.Signal, 1)
+	signal.Notify(winchCh, syscall.SIGWINCH)
+	go func() {
+		for range winchCh {
+			pm.mu.Lock()
+			ptmx := pm.ptmx
+			pm.mu.Unlock()
+			if ptmx != nil && term.IsTerminal(int(os.Stdin.Fd())) {
+				if sz, err := pty.GetsizeFull(os.Stdin); err == nil {
+					_ = pty.Setsize(ptmx, sz)
+				}
+			}
+		}
+	}()
 
 	for {
 		pm.mu.Lock()
