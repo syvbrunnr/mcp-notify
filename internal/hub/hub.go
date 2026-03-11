@@ -24,9 +24,13 @@ type Notification struct {
 type Hub struct {
 	mu            sync.Mutex
 	notifications []Notification
-	nudged        bool      // true if a nudge has been sent for current batch
+	lastNudgeAt   time.Time // when the last nudge was sent (zero if never)
 	stdinWriter   io.Writer // writes to Claude's stdin (PTY master or pipe)
 }
+
+const (
+	nudgeCooldown = 60 * time.Second // minimum interval between nudges
+)
 
 // New creates a hub that injects nudge messages into the given writer.
 func New(stdinWriter io.Writer) *Hub {
@@ -51,7 +55,7 @@ func (h *Hub) GetAndClear() []Notification {
 	defer h.mu.Unlock()
 	result := h.notifications
 	h.notifications = nil
-	h.nudged = false
+	h.lastNudgeAt = time.Time{} // reset so next notification nudges immediately
 	return result
 }
 
@@ -99,24 +103,21 @@ func (h *Hub) handleNotify(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[LOG] notification from %s: %s (pending: %d)", server, method, prevCount+1)
 
-	// Nudge once per batch. Reset by GetAndClear when client fetches notifications.
+	// Nudge with cooldown: send at most one nudge per nudgeCooldown interval.
+	// If the nudge fails (nil writer), don't update lastNudgeAt so it retries
+	// on the next notification. The Stop hook serves as the final safety net
+	// at response boundaries.
 	h.mu.Lock()
-	alreadyNudged := h.nudged
-	if !alreadyNudged {
-		h.nudged = true
-	}
+	elapsed := time.Since(h.lastNudgeAt)
+	shouldNudge := h.lastNudgeAt.IsZero() || elapsed >= nudgeCooldown
 	h.mu.Unlock()
 
-	if !alreadyNudged {
-		h.nudge()
-		// Retry nudge after 3 minutes if notifications are still pending
-		go func() {
-			time.Sleep(3 * time.Minute)
-			if h.Count() > 0 {
-				log.Printf("[LOG] retry nudge: %d notifications still pending after 3m", h.Count())
-				h.nudge()
-			}
-		}()
+	if shouldNudge {
+		if h.nudge() {
+			h.mu.Lock()
+			h.lastNudgeAt = time.Now()
+			h.mu.Unlock()
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -149,12 +150,16 @@ func (h *Hub) summaryMessage() string {
 }
 
 // nudge simulates typing a message into Claude's stdin character by character.
-// Bulk writes to the PTY master are ignored by the TUI, but character-by-character
-// delivery (like real keyboard input) is accepted even during processing.
-func (h *Hub) nudge() {
-	if h.stdinWriter == nil {
+// Returns true if the nudge was initiated (writer available), false if skipped.
+// The actual write happens asynchronously in a goroutine.
+func (h *Hub) nudge() bool {
+	h.mu.Lock()
+	writer := h.stdinWriter
+	h.mu.Unlock()
+
+	if writer == nil {
 		log.Printf("[LOG] nudge: SKIPPED — stdinWriter is nil")
-		return
+		return false
 	}
 	h.mu.Lock()
 	msg := h.summaryMessage()
@@ -165,7 +170,7 @@ func (h *Hub) nudge() {
 		written := 0
 		start := time.Now()
 		for _, c := range []byte(full) {
-			n, err := h.stdinWriter.Write([]byte{c})
+			n, err := writer.Write([]byte{c})
 			if err != nil {
 				log.Printf("[LOG] nudge: WRITE ERROR after %d/%d bytes: %v", written, len(full), err)
 				return
@@ -176,12 +181,14 @@ func (h *Hub) nudge() {
 		elapsed := time.Since(start)
 		log.Printf("[LOG] nudge: COMPLETE — wrote %d bytes in %v", written, elapsed)
 	}()
+	return true
 }
 
 // HandleStopHook is the HTTP handler for Claude Code's Stop hook.
 // When Claude finishes responding, this hook checks for pending notifications.
 // If notifications are pending, it blocks the stop and tells Claude to fetch them.
-// This replaces PTY stdin injection which is unreliable when the TUI is busy.
+// This is a safety net complementing PTY nudge — catches notifications that
+// arrived after the last nudge cooldown or weren't acted on during tool chains.
 func (h *Hub) HandleStopHook(w http.ResponseWriter, r *http.Request) {
 	h.handleStopHook(w, r)
 }
