@@ -1,0 +1,577 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/creack/pty"
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
+	"github.com/Vegard-/mcp-notify/internal/hub"
+	"golang.org/x/term"
+)
+
+const (
+	defaultPort = 9781
+	tokenFile   = ".claude-active-token" // relative to DATA_DIR
+)
+
+// processManager handles the Claude Code child process lifecycle,
+// including restart with session resume and token rotation.
+type processManager struct {
+	mu             sync.Mutex
+	cmd            *exec.Cmd
+	ptmx           *os.File    // PTY master — for stdin injection
+	stdinMu        *sync.Mutex // protects ptmx writes
+	mcpConfig      string      // path to rewritten MCP config
+	baseArgs       []string    // args passed to claude
+	extraArgs      []string    // args added by restart (--resume etc.)
+	exited         chan struct{}
+	restarting     bool
+	restartMessage string
+	hub            *hub.Hub
+	skipPerms      bool // pass --dangerously-skip-permissions
+}
+
+func newProcessManager(mcpConfig string, baseArgs []string, h *hub.Hub, skipPerms bool) *processManager {
+	return &processManager{
+		mcpConfig: mcpConfig,
+		baseArgs:  baseArgs,
+		stdinMu:   &sync.Mutex{},
+		exited:    make(chan struct{}),
+		hub:       h,
+		skipPerms: skipPerms,
+	}
+}
+
+// startClaude spawns a new Claude Code process with PTY stdin.
+func (pm *processManager) startClaude() error {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	// Build args.
+	var args []string
+	if pm.skipPerms {
+		args = append(args, "--dangerously-skip-permissions")
+	}
+	if pm.mcpConfig != "" {
+		args = append(args, "--mcp-config", pm.mcpConfig)
+	}
+	args = append(args, pm.extraArgs...)
+	args = append(args, pm.baseArgs...)
+
+	// Consume restart message.
+	msg := pm.restartMessage
+	pm.restartMessage = ""
+
+	log.Printf("starting claude with args: %v", args)
+
+	cmd := exec.Command("claude", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Token rotation: read active token if available.
+	token := readActiveToken()
+	if token != "" {
+		cmd.Env = buildCleanEnv(token)
+		log.Printf("token source: %s", tokenSource())
+	}
+
+	// Always use PTY — needed for notification nudge injection.
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		return fmt.Errorf("open pty: %w", err)
+	}
+	if _, err := term.MakeRaw(int(pts.Fd())); err != nil {
+		pts.Close()
+		ptmx.Close()
+		return fmt.Errorf("set pty raw mode: %w", err)
+	}
+	cmd.Stdin = pts
+
+	if err := cmd.Start(); err != nil {
+		pts.Close()
+		ptmx.Close()
+		return fmt.Errorf("start claude: %w", err)
+	}
+	pts.Close() // only child needs slave
+
+	pm.cmd = cmd
+	pm.ptmx = ptmx
+	pm.exited = make(chan struct{})
+
+	// Update hub's stdin writer to new PTY.
+	safeWriter := &syncWriter{w: ptmx, mu: pm.stdinMu}
+	pm.hub.SetWriter(safeWriter)
+
+	// Forward terminal stdin → PTY master.
+	go func() {
+		if msg != "" {
+			time.Sleep(5 * time.Second)
+			log.Printf("injecting restart message (%d bytes)", len(msg))
+			pm.stdinMu.Lock()
+			ptmx.Write([]byte(msg + "\r"))
+			pm.stdinMu.Unlock()
+		}
+		buf := make([]byte, 4096)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if n > 0 {
+				pm.stdinMu.Lock()
+				ptmx.Write(buf[:n])
+				pm.stdinMu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Monitor process exit.
+	go func() {
+		err := cmd.Wait()
+		log.Printf("claude exited (pid %d, err: %v)", cmd.Process.Pid, err)
+		close(pm.exited)
+	}()
+
+	log.Printf("claude started (pid %d)", cmd.Process.Pid)
+	return nil
+}
+
+// stopClaude gracefully stops the current Claude process.
+func (pm *processManager) stopClaude() error {
+	pm.mu.Lock()
+	cmd := pm.cmd
+	ptmx := pm.ptmx
+	exited := pm.exited
+	pm.mu.Unlock()
+
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		return nil
+	}
+
+	select {
+	case <-exited:
+		log.Println("claude stopped gracefully")
+	case <-time.After(10 * time.Second):
+		log.Println("claude didn't stop in time, sending SIGKILL")
+		_ = cmd.Process.Kill()
+		<-exited
+	}
+
+	if ptmx != nil {
+		ptmx.Close()
+	}
+	return nil
+}
+
+// --- Token rotation ---
+
+func dataDir() string {
+	if dir := os.Getenv("DATA_DIR"); dir != "" {
+		return dir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".mcp-data/r7-tools"
+	}
+	return filepath.Join(home, ".mcp-data", "r7-tools")
+}
+
+func readActiveToken() string {
+	path := filepath.Join(dataDir(), tokenFile)
+	data, err := os.ReadFile(path)
+	if err == nil {
+		token := strings.TrimSpace(string(data))
+		if token != "" {
+			return token
+		}
+	}
+	return os.Getenv("CLAUDE_CODE_OAUTH_TOKEN")
+}
+
+func tokenSource() string {
+	path := filepath.Join(dataDir(), tokenFile)
+	if _, err := os.Stat(path); err == nil {
+		return "file:" + path
+	}
+	return "env:CLAUDE_CODE_OAUTH_TOKEN"
+}
+
+func buildCleanEnv(token string) []string {
+	env := os.Environ()
+	result := make([]string, 0, len(env)+1)
+	for _, e := range env {
+		if !strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN=") {
+			result = append(result, e)
+		}
+	}
+	return append(result, "CLAUDE_CODE_OAUTH_TOKEN="+token)
+}
+
+// --- Session detection ---
+
+func detectSessionID() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	projectsDir := filepath.Join(home, ".claude", "projects")
+	matches, err := filepath.Glob(filepath.Join(projectsDir, "*", "*.jsonl"))
+	if err != nil || len(matches) == 0 {
+		return ""
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		fi, _ := os.Stat(matches[i])
+		fj, _ := os.Stat(matches[j])
+		if fi == nil || fj == nil {
+			return false
+		}
+		return fi.ModTime().After(fj.ModTime())
+	})
+	return strings.TrimSuffix(filepath.Base(matches[0]), ".jsonl")
+}
+
+// --- syncWriter ---
+
+type syncWriter struct {
+	w  io.Writer
+	mu *sync.Mutex
+}
+
+func (sw *syncWriter) Write(p []byte) (int, error) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return sw.w.Write(p)
+}
+
+// --- Config rewriting ---
+
+func rewriteConfig(srcPath, proxyBin string, hubPort int) (string, error) {
+	data, err := os.ReadFile(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("read config: %w", err)
+	}
+
+	var config map[string]any
+	if err := json.Unmarshal(data, &config); err != nil {
+		return "", fmt.Errorf("parse config: %w", err)
+	}
+
+	servers, _ := config["mcpServers"].(map[string]any)
+	if servers == nil {
+		servers = make(map[string]any)
+	}
+
+	hubURL := fmt.Sprintf("http://localhost:%d", hubPort)
+
+	for name, v := range servers {
+		srv, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		srvType, _ := srv["type"].(string)
+		if srvType != "" && srvType != "stdio" {
+			continue
+		}
+		origCmd, _ := srv["command"].(string)
+		if origCmd == "" {
+			continue
+		}
+		origArgs, _ := srv["args"].([]any)
+		newArgs := []any{"--hub", hubURL, "--name", name, "--", origCmd}
+		for _, a := range origArgs {
+			newArgs = append(newArgs, a)
+		}
+		srv["command"] = proxyBin
+		srv["args"] = newArgs
+		servers[name] = srv
+	}
+
+	servers["mcp-notify"] = map[string]any{
+		"type": "http",
+		"url":  hubURL + "/mcp",
+	}
+	config["mcpServers"] = servers
+
+	out, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", err
+	}
+
+	dstPath := filepath.Join(os.TempDir(), "mcp-notify-config.json")
+	if err := os.WriteFile(dstPath, out, 0644); err != nil {
+		return "", err
+	}
+	return dstPath, nil
+}
+
+// --- Proxy binary discovery ---
+
+func findProxyBinary(explicit string) string {
+	if explicit != "" {
+		if _, err := os.Stat(explicit); err == nil {
+			return explicit
+		}
+		return ""
+	}
+	self, err := os.Executable()
+	if err == nil {
+		candidate := filepath.Join(filepath.Dir(self), "mcp-notify-proxy")
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	if p, err := exec.LookPath("mcp-notify-proxy"); err == nil {
+		return p
+	}
+	return ""
+}
+
+// --- MCP tool registration ---
+
+func registerTools(mcpServer *server.MCPServer, h *hub.Hub, pm *processManager, port int) {
+	// get_notifications — returns and clears buffered MCP notifications.
+	notifyTool := mcp.NewTool(
+		"get_notifications",
+		mcp.WithDescription("Get pending MCP notifications from proxied servers. Returns and clears all buffered notifications."),
+	)
+	mcpServer.AddTool(notifyTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		notifications := h.GetAndClear()
+		if len(notifications) == 0 {
+			return mcp.NewToolResultText("No pending notifications."), nil
+		}
+		out, _ := json.MarshalIndent(notifications, "", "  ")
+		return mcp.NewToolResultText(string(out)), nil
+	})
+
+	// restart_claude — restart with session resume and token rotation.
+	restartTool := mcp.NewTool(
+		"restart_claude",
+		mcp.WithDescription("Restart Claude Code. Picks up new MCP configs, credential changes, or recovers from issues. Resumes the most recent session by default."),
+		mcp.WithBoolean("continue", mcp.Description("Resume the most recent session (default: true)")),
+		mcp.WithString("resume_id", mcp.Description("Resume a specific session by ID")),
+		mcp.WithString("message", mcp.Description("Message to inject as initial prompt after restart")),
+	)
+	mcpServer.AddTool(restartTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		log.Println("restart_claude called")
+
+		shouldContinue := req.GetBool("continue", true)
+		resumeID := req.GetString("resume_id", "")
+		message := req.GetString("message", "")
+
+		var newArgs []string
+		if resumeID != "" {
+			newArgs = append(newArgs, "--resume", resumeID)
+		} else if shouldContinue {
+			if sid := detectSessionID(); sid != "" {
+				log.Printf("auto-detected session: %s", sid)
+				newArgs = append(newArgs, "--resume", sid)
+			} else {
+				newArgs = append(newArgs, "--continue")
+			}
+		}
+
+		if message == "" {
+			message = "You have been restarted by mcp-notify. Continue your previous work."
+		}
+
+		pm.mu.Lock()
+		pm.extraArgs = newArgs
+		pm.restartMessage = message
+		pm.mu.Unlock()
+
+		go func() {
+			pm.mu.Lock()
+			pm.restarting = true
+			pm.mu.Unlock()
+
+			log.Println("restart: waiting 10s for tool result flush...")
+			time.Sleep(10 * time.Second)
+
+			// SIGINT → 5s → SIGTERM → 5s → force kill + start new.
+			pm.mu.Lock()
+			cmd := pm.cmd
+			pm.mu.Unlock()
+			if cmd != nil && cmd.Process != nil {
+				log.Println("restart: sending SIGINT...")
+				_ = cmd.Process.Signal(syscall.SIGINT)
+			}
+
+			log.Println("restart: waiting 5s for SIGINT shutdown...")
+			time.Sleep(5 * time.Second)
+
+			pm.mu.Lock()
+			cmd = pm.cmd
+			pm.mu.Unlock()
+			if cmd != nil && cmd.Process != nil {
+				log.Println("restart: sending SIGTERM...")
+				_ = cmd.Process.Signal(syscall.SIGTERM)
+			}
+
+			log.Println("restart: waiting 5s for graceful shutdown...")
+			time.Sleep(5 * time.Second)
+
+			log.Println("restart: stopping old process...")
+			_ = pm.stopClaude()
+
+			log.Println("restart: starting new process...")
+			if err := pm.startClaude(); err != nil {
+				log.Printf("restart: start failed: %v", err)
+			}
+
+			pm.mu.Lock()
+			pm.restarting = false
+			pm.mu.Unlock()
+			log.Println("restart: complete")
+		}()
+
+		return mcp.NewToolResultText("Claude Code will restart in ~20 seconds (10s flush + SIGINT 5s + SIGTERM 5s). Session will be resumed automatically."), nil
+	})
+
+	// wrapper_status — show process state, token source, port.
+	statusTool := mcp.NewTool(
+		"wrapper_status",
+		mcp.WithDescription("Show mcp-notify wrapper status: active token source, Claude process state, notification count."),
+	)
+	mcpServer.AddTool(statusTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		pm.mu.Lock()
+		cmd := pm.cmd
+		pm.mu.Unlock()
+
+		pid := 0
+		if cmd != nil && cmd.Process != nil {
+			pid = cmd.Process.Pid
+		}
+
+		result := map[string]any{
+			"token_source":        tokenSource(),
+			"claude_pid":          pid,
+			"mcp_port":            port,
+			"pending_notifications": h.Count(),
+		}
+		out, _ := json.MarshalIndent(result, "", "  ")
+		return mcp.NewToolResultText(string(out)), nil
+	})
+}
+
+// --- Main ---
+
+func main() {
+	log.SetOutput(os.Stderr)
+	log.SetPrefix("[mcp-notify] ")
+
+	mcpConfig := flag.String("mcp-config", "", "Path to MCP config JSON")
+	port := flag.Int("port", defaultPort, "Hub port")
+	proxyBin := flag.String("proxy-bin", "", "Path to mcp-notify-proxy binary")
+	skipPerms := flag.Bool("skip-permissions", false, "Pass --dangerously-skip-permissions to Claude")
+	flag.Parse()
+
+	claudeArgs := flag.Args()
+
+	// Find proxy binary.
+	proxyPath := findProxyBinary(*proxyBin)
+	if proxyPath == "" {
+		log.Fatal("cannot find mcp-notify-proxy binary — specify with --proxy-bin or ensure it's in PATH or same directory")
+	}
+	log.Printf("proxy binary: %s", proxyPath)
+
+	// Rewrite MCP config to insert proxy wrappers.
+	var rewrittenConfig string
+	if *mcpConfig != "" {
+		var err error
+		rewrittenConfig, err = rewriteConfig(*mcpConfig, proxyPath, *port)
+		if err != nil {
+			log.Fatalf("rewrite config: %v", err)
+		}
+		log.Printf("rewritten config: %s", rewrittenConfig)
+	}
+
+	// Create hub (writer set later when Claude starts).
+	h := hub.New(nil)
+
+	// Create process manager.
+	pm := newProcessManager(rewrittenConfig, claudeArgs, h, *skipPerms)
+
+	// Build MCP server with all tools.
+	mcpServer := server.NewMCPServer("mcp-notify", "1.0.0", server.WithToolCapabilities(true))
+	registerTools(mcpServer, h, pm, *port)
+
+	// Start HTTP server.
+	httpMux := http.NewServeMux()
+	httpMux.HandleFunc("/notify", h.HandleNotify)
+	httpMux.HandleFunc("/health", h.HandleHealth)
+	mcpHTTP := server.NewStreamableHTTPServer(mcpServer)
+	httpMux.Handle("/mcp", mcpHTTP)
+
+	httpServer := &http.Server{
+		Addr:    fmt.Sprintf(":%d", *port),
+		Handler: httpMux,
+	}
+
+	ln, err := net.Listen("tcp", httpServer.Addr)
+	if err != nil {
+		log.Fatalf("listen %s: %v", httpServer.Addr, err)
+	}
+	log.Printf("hub listening on %s", httpServer.Addr)
+	go httpServer.Serve(ln)
+
+	// Start Claude.
+	if err := pm.startClaude(); err != nil {
+		log.Fatalf("initial start: %v", err)
+	}
+
+	// Main loop: wait for exit or signal, support restart.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+
+	for {
+		pm.mu.Lock()
+		exited := pm.exited
+		pm.mu.Unlock()
+
+		select {
+		case <-exited:
+			pm.mu.Lock()
+			restarting := pm.restarting
+			pm.mu.Unlock()
+			if restarting {
+				log.Println("claude exited during restart, waiting for new process...")
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			log.Println("claude exited, shutting down")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = httpServer.Shutdown(ctx)
+			cancel()
+			os.Exit(0)
+
+		case sig := <-sigCh:
+			log.Printf("received %v, stopping", sig)
+			_ = pm.stopClaude()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = httpServer.Shutdown(ctx)
+			cancel()
+			os.Exit(0)
+		}
+	}
+}

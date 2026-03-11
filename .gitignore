@@ -1,0 +1,4 @@
+bin/
+/mcp-notify
+/mcp-notify-proxy
+*.exe
