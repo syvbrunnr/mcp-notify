@@ -1,3 +1,8 @@
+// mcp-notify wraps Claude Code with a transparent MCP notification proxy.
+// It intercepts MCP server notifications, buffers them, and injects nudge
+// messages into Claude's PTY stdin so that Claude can be alerted to new
+// notifications without polling. Also supports token rotation and session
+// resume on restart.
 package main
 
 import (
@@ -29,6 +34,13 @@ import (
 const (
 	defaultPort = 9781
 	tokenFile   = ".claude-active-token" // relative to DATA_DIR
+
+	stdinBufSize          = 4096
+	restartMsgDelay       = 5 * time.Second
+	restartFlushDelay     = 10 * time.Second
+	restartSignalInterval = 5 * time.Second
+	shutdownTimeout       = 5 * time.Second
+	stopTimeout           = 10 * time.Second
 )
 
 // processManager handles the Claude Code child process lifecycle,
@@ -128,7 +140,7 @@ func (pm *processManager) startClaude() error {
 	// Inject restart message after delay if needed.
 	if msg != "" {
 		go func() {
-			time.Sleep(5 * time.Second)
+			time.Sleep(restartMsgDelay)
 			log.Printf("injecting restart message (%d bytes)", len(msg))
 			pm.stdinMu.Lock()
 			ptmx.Write([]byte(msg + "\r"))
@@ -144,7 +156,7 @@ func (pm *processManager) startClaude() error {
 	if !pm.stdinStarted {
 		pm.stdinStarted = true
 		go func() {
-			buf := make([]byte, 4096)
+			buf := make([]byte, stdinBufSize)
 			for {
 				n, err := os.Stdin.Read(buf)
 				if n > 0 {
@@ -191,7 +203,7 @@ func (pm *processManager) stopClaude() error {
 	select {
 	case <-exited:
 		log.Println("claude stopped gracefully")
-	case <-time.After(10 * time.Second):
+	case <-time.After(stopTimeout):
 		log.Println("claude didn't stop in time, sending SIGKILL")
 		_ = cmd.Process.Kill()
 		<-exited
@@ -270,8 +282,9 @@ func detectSessionID() string {
 	return strings.TrimSuffix(filepath.Base(matches[0]), ".jsonl")
 }
 
-// --- syncWriter ---
-
+// syncWriter synchronizes writes to the PTY master fd.
+// Multiple goroutines (stdin reader, hub nudge, restart message injection)
+// may write concurrently; this prevents interleaved or corrupted output.
 type syncWriter struct {
 	w  io.Writer
 	mu *sync.Mutex
@@ -337,7 +350,7 @@ func rewriteConfig(srcPath, proxyBin string, hubPort int) (string, error) {
 		return "", err
 	}
 
-	dstPath := filepath.Join(os.TempDir(), "mcp-notify-config.json")
+	dstPath := filepath.Join(os.TempDir(), fmt.Sprintf("mcp-notify-config-%d.json", os.Getpid()))
 	if err := os.WriteFile(dstPath, out, 0644); err != nil {
 		return "", err
 	}
@@ -379,7 +392,10 @@ func registerTools(mcpServer *server.MCPServer, h *hub.Hub, pm *processManager, 
 		if len(notifications) == 0 {
 			return mcp.NewToolResultText("No pending notifications."), nil
 		}
-		out, _ := json.MarshalIndent(notifications, "", "  ")
+		out, err := json.MarshalIndent(notifications, "", "  ")
+		if err != nil {
+			return mcp.NewToolResultText(fmt.Sprintf("error marshaling notifications: %v", err)), nil
+		}
 		return mcp.NewToolResultText(string(out)), nil
 	})
 
@@ -424,10 +440,10 @@ func registerTools(mcpServer *server.MCPServer, h *hub.Hub, pm *processManager, 
 			pm.restarting = true
 			pm.mu.Unlock()
 
-			log.Println("restart: waiting 10s for tool result flush...")
-			time.Sleep(10 * time.Second)
+			log.Printf("restart: waiting %s for tool result flush...", restartFlushDelay)
+			time.Sleep(restartFlushDelay)
 
-			// SIGINT → 5s → SIGTERM → 5s → force kill + start new.
+			// SIGINT → wait → SIGTERM → wait → force kill + start new.
 			pm.mu.Lock()
 			cmd := pm.cmd
 			pm.mu.Unlock()
@@ -436,8 +452,8 @@ func registerTools(mcpServer *server.MCPServer, h *hub.Hub, pm *processManager, 
 				_ = cmd.Process.Signal(syscall.SIGINT)
 			}
 
-			log.Println("restart: waiting 5s for SIGINT shutdown...")
-			time.Sleep(5 * time.Second)
+			log.Printf("restart: waiting %s for SIGINT shutdown...", restartSignalInterval)
+			time.Sleep(restartSignalInterval)
 
 			pm.mu.Lock()
 			cmd = pm.cmd
@@ -447,8 +463,8 @@ func registerTools(mcpServer *server.MCPServer, h *hub.Hub, pm *processManager, 
 				_ = cmd.Process.Signal(syscall.SIGTERM)
 			}
 
-			log.Println("restart: waiting 5s for graceful shutdown...")
-			time.Sleep(5 * time.Second)
+			log.Printf("restart: waiting %s for graceful shutdown...", restartSignalInterval)
+			time.Sleep(restartSignalInterval)
 
 			log.Println("restart: stopping old process...")
 			_ = pm.stopClaude()
@@ -488,7 +504,10 @@ func registerTools(mcpServer *server.MCPServer, h *hub.Hub, pm *processManager, 
 			"mcp_port":            port,
 			"pending_notifications": h.Count(),
 		}
-		out, _ := json.MarshalIndent(result, "", "  ")
+		out, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return mcp.NewToolResultText(fmt.Sprintf("error marshaling status: %v", err)), nil
+		}
 		return mcp.NewToolResultText(string(out)), nil
 	})
 }
@@ -609,7 +628,7 @@ func main() {
 				continue
 			}
 			log.Println("claude exited, shutting down")
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 			_ = httpServer.Shutdown(ctx)
 			cancel()
 			os.Exit(0)
@@ -617,7 +636,7 @@ func main() {
 		case sig := <-sigCh:
 			log.Printf("received %v, stopping", sig)
 			_ = pm.stopClaude()
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 			_ = httpServer.Shutdown(ctx)
 			cancel()
 			os.Exit(0)

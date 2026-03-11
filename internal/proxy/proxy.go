@@ -12,7 +12,10 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 )
+
+var hubClient = &http.Client{Timeout: 5 * time.Second}
 
 // JSONRPCMessage represents a minimal JSON-RPC 2.0 message.
 type JSONRPCMessage struct {
@@ -134,7 +137,7 @@ func (p *Proxy) sendToHub(raw []byte, method string) {
 		"raw":    {string(raw)},
 	}
 
-	resp, err := http.PostForm(p.hubURL+"/notify", payload)
+	resp, err := hubClient.PostForm(p.hubURL+"/notify", payload)
 	if err != nil {
 		log.Printf("notify hub: %v", err)
 		return
