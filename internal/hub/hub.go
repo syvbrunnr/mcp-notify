@@ -153,21 +153,28 @@ func (h *Hub) summaryMessage() string {
 // delivery (like real keyboard input) is accepted even during processing.
 func (h *Hub) nudge() {
 	if h.stdinWriter == nil {
+		log.Printf("[LOG] nudge: SKIPPED — stdinWriter is nil")
 		return
 	}
 	h.mu.Lock()
 	msg := h.summaryMessage()
 	h.mu.Unlock()
+	log.Printf("[LOG] nudge: starting char-by-char injection (%d bytes + CR)", len(msg))
 	go func() {
 		full := msg + "\r"
+		written := 0
+		start := time.Now()
 		for _, c := range []byte(full) {
-			_, err := h.stdinWriter.Write([]byte{c})
+			n, err := h.stdinWriter.Write([]byte{c})
 			if err != nil {
-				log.Printf("[LOG] nudge stdin: %v", err)
+				log.Printf("[LOG] nudge: WRITE ERROR after %d/%d bytes: %v", written, len(full), err)
 				return
 			}
+			written += n
 			time.Sleep(5 * time.Millisecond)
 		}
+		elapsed := time.Since(start)
+		log.Printf("[LOG] nudge: COMPLETE — wrote %d bytes in %v", written, elapsed)
 	}()
 }
 
@@ -207,6 +214,63 @@ func (h *Hub) handleStopHook(w http.ResponseWriter, r *http.Request) {
 
 	out, _ := json.Marshal(map[string]any{
 		"decision": "approve",
+	})
+	w.Write(out)
+}
+
+// HandleTestNudge triggers a nudge for diagnostic purposes.
+// Call via: curl -X POST localhost:9781/test-nudge
+// Use this to test nudge delivery while Claude is idle vs generating.
+func (h *Hub) HandleTestNudge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	msg := r.FormValue("msg")
+	if msg == "" {
+		msg = "[mcp-notify] test nudge — if you see this as a user message, PTY delivery works"
+	}
+
+	log.Printf("[LOG] test-nudge: injecting %d bytes", len(msg))
+	h.mu.Lock()
+	writer := h.stdinWriter
+	h.mu.Unlock()
+
+	if writer == nil {
+		http.Error(w, "no stdin writer available", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Write char-by-char like nudge() does, but synchronously so we can report results.
+	full := msg + "\r"
+	var writeErr error
+	for _, c := range []byte(full) {
+		_, err := writer.Write([]byte{c})
+		if err != nil {
+			writeErr = err
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if writeErr != nil {
+		log.Printf("[LOG] test-nudge: write error: %v", writeErr)
+		out, _ := json.Marshal(map[string]any{
+			"status": "error",
+			"error":  writeErr.Error(),
+			"bytes":  len(full),
+		})
+		w.Write(out)
+		return
+	}
+
+	log.Printf("[LOG] test-nudge: wrote %d bytes successfully", len(full))
+	out, _ := json.Marshal(map[string]any{
+		"status": "ok",
+		"bytes":  len(full),
+		"msg":    msg,
 	})
 	w.Write(out)
 }

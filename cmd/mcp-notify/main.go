@@ -110,14 +110,18 @@ func (pm *processManager) startClaude() error {
 	if err != nil {
 		return fmt.Errorf("open pty: %w", err)
 	}
+	log.Printf("PTY opened: master=%s (fd=%d), slave=%s (fd=%d)", ptmx.Name(), ptmx.Fd(), pts.Name(), pts.Fd())
 
 	// Propagate outer terminal size to inner PTY so Claude's TUI renders correctly.
 	// Without this, the inner PTY defaults to 80x24 which breaks Claude's layout,
 	// especially in Docker where the PTY chain is longer.
 	if term.IsTerminal(int(os.Stdin.Fd())) {
 		if sz, err := pty.GetsizeFull(os.Stdin); err == nil {
+			log.Printf("PTY size propagated: %dx%d", sz.Cols, sz.Rows)
 			_ = pty.Setsize(ptmx, sz)
 		}
+	} else {
+		log.Printf("WARNING: outer stdin is not a terminal — PTY size not propagated")
 	}
 
 	cmd.Stdin = pts
@@ -559,6 +563,7 @@ func main() {
 	httpMux.HandleFunc("/notify", h.HandleNotify)
 	httpMux.HandleFunc("/health", h.HandleHealth)
 	httpMux.HandleFunc("/hook/stop", h.HandleStopHook)
+	httpMux.HandleFunc("/test-nudge", h.HandleTestNudge)
 	mcpHTTP := server.NewStreamableHTTPServer(mcpServer)
 	httpMux.Handle("/mcp", mcpHTTP)
 
@@ -580,12 +585,15 @@ func main() {
 	// breaks Claude's TUI (especially in Docker where there's a double
 	// PTY layer).
 	if term.IsTerminal(int(os.Stdin.Fd())) {
+		log.Printf("stdin is a terminal (fd=%d), setting raw mode", os.Stdin.Fd())
 		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 		if err != nil {
 			log.Printf("warning: failed to set raw mode on stdin: %v", err)
 		} else {
 			defer term.Restore(int(os.Stdin.Fd()), oldState)
 		}
+	} else {
+		log.Printf("WARNING: stdin is NOT a terminal (fd=%d) — raw mode not set, line buffering may be active", os.Stdin.Fd())
 	}
 
 	// Start Claude.
