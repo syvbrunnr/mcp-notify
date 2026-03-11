@@ -149,9 +149,12 @@ func (h *Hub) summaryMessage() string {
 		total, strings.Join(parts, ", "))
 }
 
-// nudge simulates typing a message into Claude's stdin character by character.
+// nudge delivers a notification message to Claude's stdin using bracketed paste.
+// Bracketed paste (\e[200~ ... \e[201~) causes the TUI's key parser to treat
+// the entire message as a single paste event, bypassing per-character input
+// filters (voice detection, key repeat detection) that can intercept rapid
+// same-character sequences from char-by-char delivery.
 // Returns true if the nudge was initiated (writer available), false if skipped.
-// The actual write happens asynchronously in a goroutine.
 func (h *Hub) nudge() bool {
 	h.mu.Lock()
 	writer := h.stdinWriter
@@ -164,22 +167,23 @@ func (h *Hub) nudge() bool {
 	h.mu.Lock()
 	msg := h.summaryMessage()
 	h.mu.Unlock()
-	log.Printf("[LOG] nudge: starting char-by-char injection (%d bytes + CR)", len(msg))
+
 	go func() {
-		full := msg + "\r"
-		written := 0
-		start := time.Now()
-		for _, c := range []byte(full) {
-			n, err := writer.Write([]byte{c})
-			if err != nil {
-				log.Printf("[LOG] nudge: WRITE ERROR after %d/%d bytes: %v", written, len(full), err)
-				return
-			}
-			written += n
-			time.Sleep(5 * time.Millisecond)
+		// Wrap message in bracketed paste escape sequences, then CR to submit.
+		paste := "\x1b[200~" + msg + "\x1b[201~"
+		n, err := writer.Write([]byte(paste))
+		if err != nil {
+			log.Printf("[LOG] nudge: WRITE ERROR (paste): %v", err)
+			return
 		}
-		elapsed := time.Since(start)
-		log.Printf("[LOG] nudge: COMPLETE — wrote %d bytes in %v", written, elapsed)
+		// Brief pause before CR to let the paste buffer flush.
+		time.Sleep(10 * time.Millisecond)
+		_, err = writer.Write([]byte("\r"))
+		if err != nil {
+			log.Printf("[LOG] nudge: WRITE ERROR (CR): %v", err)
+			return
+		}
+		log.Printf("[LOG] nudge: COMPLETE — wrote %d bytes (bracketed paste + CR)", n+1)
 	}()
 	return true
 }
@@ -249,17 +253,14 @@ func (h *Hub) HandleTestNudge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write char-by-char like nudge() does, but synchronously so we can report results.
-	full := msg + "\r"
-	var writeErr error
-	for _, c := range []byte(full) {
-		_, err := writer.Write([]byte{c})
-		if err != nil {
-			writeErr = err
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+	// Use bracketed paste like nudge() does, but synchronously so we can report results.
+	paste := "\x1b[200~" + msg + "\x1b[201~"
+	_, writeErr := writer.Write([]byte(paste))
+	if writeErr == nil {
+		time.Sleep(10 * time.Millisecond)
+		_, writeErr = writer.Write([]byte("\r"))
 	}
+	full := paste + "\r"
 
 	w.Header().Set("Content-Type", "application/json")
 	if writeErr != nil {
