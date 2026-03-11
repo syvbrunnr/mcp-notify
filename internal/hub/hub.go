@@ -34,7 +34,7 @@ type Hub struct {
 func New(stdinWriter io.Writer) *Hub {
 	return &Hub{
 		stdinWriter:  stdinWriter,
-		nudgeMessage: "[mcp-notify] You have new notifications. Call the get_notifications tool to see them.\r",
+		nudgeMessage: "[mcp-notify] You have new notifications. Call the get_notifications tool to see them.",
 		startedAt:    time.Now(),
 		gracePeriod:  3 * time.Second,
 	}
@@ -107,21 +107,71 @@ func (h *Hub) handleNotify(w http.ResponseWriter, r *http.Request) {
 	// Skip during startup grace period to avoid flooding from initial sync.
 	if prevCount == 0 && time.Since(h.startedAt) > h.gracePeriod {
 		h.nudge()
+		// Retry nudge after 3 minutes if notifications are still pending
+		go func() {
+			time.Sleep(3 * time.Minute)
+			if h.Count() > 0 {
+				log.Printf("retry nudge: %d notifications still pending after 3m", h.Count())
+				h.nudge()
+			}
+		}()
 	}
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "ok")
 }
 
-// nudge writes a message to Claude's stdin to trigger tool use.
+// nudge simulates typing a message into Claude's stdin character by character.
+// Bulk writes to the PTY master are ignored by the TUI, but character-by-character
+// delivery (like real keyboard input) is accepted even during processing.
 func (h *Hub) nudge() {
 	if h.stdinWriter == nil {
 		return
 	}
-	_, err := h.stdinWriter.Write([]byte(h.nudgeMessage))
-	if err != nil {
-		log.Printf("nudge stdin: %v", err)
+	go func() {
+		msg := h.nudgeMessage + "\r"
+		for _, c := range []byte(msg) {
+			_, err := h.stdinWriter.Write([]byte{c})
+			if err != nil {
+				log.Printf("nudge stdin: %v", err)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+}
+
+// HandleStopHook is the HTTP handler for Claude Code's Stop hook.
+// When Claude finishes responding, this hook checks for pending notifications.
+// If notifications are pending, it blocks the stop and tells Claude to fetch them.
+// This replaces PTY stdin injection which is unreliable when the TUI is busy.
+func (h *Hub) HandleStopHook(w http.ResponseWriter, r *http.Request) {
+	h.handleStopHook(w, r)
+}
+
+func (h *Hub) handleStopHook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
 	}
+
+	count := h.Count()
+	w.Header().Set("Content-Type", "application/json")
+
+	if count > 0 {
+		log.Printf("stop hook: blocking — %d pending notifications", count)
+		out, _ := json.Marshal(map[string]any{
+			"decision": "block",
+			"reason":   fmt.Sprintf("[mcp-notify] You have %d new notifications. Call the get_notifications tool to see them.", count),
+		})
+		w.Write(out)
+		return
+	}
+
+	out, _ := json.Marshal(map[string]any{
+		"decision": "approve",
+	})
+	w.Write(out)
 }
 
 // handleHealth is a simple health check endpoint.

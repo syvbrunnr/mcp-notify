@@ -558,6 +558,7 @@ func main() {
 	httpMux := http.NewServeMux()
 	httpMux.HandleFunc("/notify", h.HandleNotify)
 	httpMux.HandleFunc("/health", h.HandleHealth)
+	httpMux.HandleFunc("/hook/stop", h.HandleStopHook)
 	mcpHTTP := server.NewStreamableHTTPServer(mcpServer)
 	httpMux.Handle("/mcp", mcpHTTP)
 

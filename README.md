@@ -152,7 +152,7 @@ HTTP MCP servers are left untouched. The hub is added as an HTTP MCP server so t
 
 1. MCP server emits a JSON-RPC notification on stdout
 2. `mcp-notify-proxy` intercepts it, forwards to hub via HTTP POST, and passes it through to the client
-3. Hub stores the notification and injects a nudge message into the client's PTY stdin
+3. Hub stores the notification and injects a nudge into the client's PTY stdin (character-by-character to simulate real keyboard input)
 4. Client sees the nudge and calls `get_notifications` to retrieve the details
 
 ### Startup behavior
@@ -170,6 +170,33 @@ On startup, MCP servers often emit a burst of notifications as they sync initial
 ## Token Rotation
 
 On startup and restart, `mcp-notify` checks for an active token at `$DATA_DIR/.claude-active-token` (defaults to `~/.mcp-data/r7-tools/.claude-active-token`). If found, it's injected as `CLAUDE_CODE_OAUTH_TOKEN`. Falls back to the environment variable.
+
+## Optional: Stop Hook (Claude Code)
+
+For a belt-and-suspenders approach, you can add a [Stop hook](https://docs.anthropic.com/en/docs/claude-code/hooks) that catches any notifications the client missed. When Claude finishes responding, the hook checks for pending notifications and blocks the stop if any exist.
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:9781/hook/stop",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+This is **not required** — the PTY nudge handles most cases. The Stop hook is a catch-all backup for notifications that arrive while the client is mid-response and the nudge gets lost.
 
 ## Testing
 
