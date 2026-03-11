@@ -155,10 +155,6 @@ HTTP MCP servers are left untouched. The hub is added as an HTTP MCP server so t
 3. Hub stores the notification and injects a nudge into the client's PTY stdin (character-by-character to simulate real keyboard input)
 4. Client sees the nudge and calls `get_notifications` to retrieve the details
 
-### Startup behavior
-
-On startup, MCP servers often emit a burst of notifications as they sync initial state. To avoid flooding the client, the hub suppresses nudges for the first 3 seconds. Notifications are still collected — they just don't trigger a nudge until the grace period ends.
-
 ### Process management
 
 `mcp-notify` manages the child process with PTY stdin. This enables:

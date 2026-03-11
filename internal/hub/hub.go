@@ -24,19 +24,14 @@ type Notification struct {
 type Hub struct {
 	mu            sync.Mutex
 	notifications []Notification
+	nudged        bool      // true if a nudge has been sent for current batch
 	stdinWriter   io.Writer // writes to Claude's stdin (PTY master or pipe)
-	startedAt     time.Time // suppress nudges during startup grace period
-	gracePeriod   time.Duration
 }
 
 // New creates a hub that injects nudge messages into the given writer.
-// Nudges are suppressed for the first 3 seconds to let MCP servers finish their
-// initial sync without flooding the client with startup notifications.
 func New(stdinWriter io.Writer) *Hub {
 	return &Hub{
 		stdinWriter: stdinWriter,
-		startedAt:   time.Now(),
-		gracePeriod: 3 * time.Second,
 	}
 }
 
@@ -56,6 +51,7 @@ func (h *Hub) GetAndClear() []Notification {
 	defer h.mu.Unlock()
 	result := h.notifications
 	h.notifications = nil
+	h.nudged = false
 	return result
 }
 
@@ -101,17 +97,23 @@ func (h *Hub) handleNotify(w http.ResponseWriter, r *http.Request) {
 	h.notifications = append(h.notifications, n)
 	h.mu.Unlock()
 
-	log.Printf("notification from %s: %s (pending: %d)", server, method, prevCount+1)
+	log.Printf("[LOG] notification from %s: %s (pending: %d)", server, method, prevCount+1)
 
-	// Only nudge on first notification (avoid spamming stdin).
-	// Skip during startup grace period to avoid flooding from initial sync.
-	if prevCount == 0 && time.Since(h.startedAt) > h.gracePeriod {
+	// Nudge once per batch. Reset by GetAndClear when client fetches notifications.
+	h.mu.Lock()
+	alreadyNudged := h.nudged
+	if !alreadyNudged {
+		h.nudged = true
+	}
+	h.mu.Unlock()
+
+	if !alreadyNudged {
 		h.nudge()
 		// Retry nudge after 3 minutes if notifications are still pending
 		go func() {
 			time.Sleep(3 * time.Minute)
 			if h.Count() > 0 {
-				log.Printf("retry nudge: %d notifications still pending after 3m", h.Count())
+				log.Printf("[LOG] retry nudge: %d notifications still pending after 3m", h.Count())
 				h.nudge()
 			}
 		}()
@@ -161,7 +163,7 @@ func (h *Hub) nudge() {
 		for _, c := range []byte(full) {
 			_, err := h.stdinWriter.Write([]byte{c})
 			if err != nil {
-				log.Printf("nudge stdin: %v", err)
+				log.Printf("[LOG] nudge stdin: %v", err)
 				return
 			}
 			time.Sleep(5 * time.Millisecond)
@@ -194,7 +196,7 @@ func (h *Hub) handleStopHook(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	if count > 0 {
-		log.Printf("stop hook: blocking — %d pending notifications", count)
+		log.Printf("[LOG] stop hook: blocking — %d pending notifications", count)
 		out, _ := json.Marshal(map[string]any{
 			"decision": "block",
 			"reason":   msg,

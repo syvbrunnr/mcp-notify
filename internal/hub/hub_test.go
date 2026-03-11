@@ -53,10 +53,10 @@ func TestGetAndClear(t *testing.T) {
 func TestNudgeOnFirstOnly(t *testing.T) {
 	var buf bytes.Buffer
 	h := New(&buf)
-	h.startedAt = time.Now().Add(-10 * time.Second) // bypass grace period
 
 	// First notification should trigger nudge.
 	addNotification(t, h, "s1", "notifications/test")
+	time.Sleep(600 * time.Millisecond) // wait for async char-by-char nudge
 	if buf.Len() == 0 {
 		t.Error("expected nudge on first notification")
 	}
@@ -65,6 +65,7 @@ func TestNudgeOnFirstOnly(t *testing.T) {
 
 	// Second notification should NOT trigger another nudge.
 	addNotification(t, h, "s2", "notifications/test2")
+	time.Sleep(50 * time.Millisecond)
 	if buf.Len() != nudgeLen {
 		t.Error("expected no additional nudge on second notification")
 	}
@@ -72,8 +73,32 @@ func TestNudgeOnFirstOnly(t *testing.T) {
 	// Clear notifications, then add another — should nudge again.
 	h.GetAndClear()
 	addNotification(t, h, "s3", "notifications/test3")
+	time.Sleep(600 * time.Millisecond) // wait for async nudge
 	if buf.Len() == nudgeLen {
 		t.Error("expected nudge after clear + new notification")
+	}
+}
+
+func TestStartupNotificationDoesNotBlockLater(t *testing.T) {
+	var buf bytes.Buffer
+	h := New(&buf)
+
+	// Simulate startup: tools/list_changed arrives immediately.
+	addNotification(t, h, "matrix", "notifications/tools/list_changed")
+	time.Sleep(600 * time.Millisecond) // wait for async nudge
+	if buf.Len() == 0 {
+		t.Error("expected nudge even for startup notification")
+	}
+
+	// Client fetches and clears (resets nudged flag).
+	h.GetAndClear()
+	nudgeLen := buf.Len()
+
+	// Later, a real message notification should nudge again.
+	addNotification(t, h, "matrix", "notifications/resources/list_changed")
+	time.Sleep(600 * time.Millisecond)
+	if buf.Len() == nudgeLen {
+		t.Error("expected nudge for real notification after clear")
 	}
 }
 
