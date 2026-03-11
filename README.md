@@ -38,14 +38,14 @@ MCP servers can emit JSON-RPC notifications (`notifications/resources/list_chang
 ## Installation
 
 ```bash
-go install github.com/Vegard-/mcp-notify/cmd/mcp-notify@latest
-go install github.com/Vegard-/mcp-notify/cmd/mcp-notify-proxy@latest
+go install github.com/syvbrunnr/mcp-notify/cmd/mcp-notify@latest
+go install github.com/syvbrunnr/mcp-notify/cmd/mcp-notify-proxy@latest
 ```
 
 Or build from source:
 
 ```bash
-git clone https://github.com/Vegard-/mcp-notify.git
+git clone https://github.com/syvbrunnr/mcp-notify.git
 cd mcp-notify
 go build -o bin/ ./cmd/mcp-notify/
 go build -o bin/ ./cmd/mcp-notify-proxy/

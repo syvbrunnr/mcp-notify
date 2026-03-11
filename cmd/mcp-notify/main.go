@@ -27,7 +27,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
-	"github.com/Vegard-/mcp-notify/internal/hub"
+	"github.com/syvbrunnr/mcp-notify/internal/hub"
 	"golang.org/x/term"
 )
 

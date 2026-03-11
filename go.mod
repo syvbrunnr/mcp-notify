@@ -1,4 +1,4 @@
-module github.com/Vegard-/mcp-notify
+module github.com/syvbrunnr/mcp-notify
 
 go 1.24.1
 

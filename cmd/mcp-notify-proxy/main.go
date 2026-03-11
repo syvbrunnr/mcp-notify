@@ -6,7 +6,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/Vegard-/mcp-notify/internal/proxy"
+	"github.com/syvbrunnr/mcp-notify/internal/proxy"
 )
 
 func main() {
