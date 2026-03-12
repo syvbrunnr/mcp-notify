@@ -142,17 +142,18 @@ func (pm *processManager) startClaude() error {
 	pm.hub.SetWriter(safeWriter)
 
 	// Inject restart message after delay if needed.
-	// Uses bracketed paste to bypass per-character input filters.
+	// Uses char-by-char delivery to simulate real typing.
 	if msg != "" {
 		go func() {
 			time.Sleep(restartMsgDelay)
-			paste := "\x1b[200~" + msg + "\x1b[201~"
-			log.Printf("injecting restart message (%d bytes, bracketed paste)", len(msg))
-			pm.stdinMu.Lock()
-			ptmx.Write([]byte(paste))
-			time.Sleep(10 * time.Millisecond)
-			ptmx.Write([]byte("\r"))
-			pm.stdinMu.Unlock()
+			full := msg + "\r"
+			log.Printf("injecting restart message (%d bytes, char-by-char)", len(full))
+			for _, c := range []byte(full) {
+				pm.stdinMu.Lock()
+				ptmx.Write([]byte{c})
+				pm.stdinMu.Unlock()
+				time.Sleep(5 * time.Millisecond)
+			}
 		}()
 	}
 

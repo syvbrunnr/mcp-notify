@@ -169,21 +169,20 @@ func (h *Hub) nudge() bool {
 	h.mu.Unlock()
 
 	go func() {
-		// Wrap message in bracketed paste escape sequences, then CR to submit.
-		paste := "\x1b[200~" + msg + "\x1b[201~"
-		n, err := writer.Write([]byte(paste))
-		if err != nil {
-			log.Printf("[LOG] nudge: WRITE ERROR (paste): %v", err)
-			return
+		full := msg + "\r"
+		written := 0
+		start := time.Now()
+		for _, c := range []byte(full) {
+			n, err := writer.Write([]byte{c})
+			if err != nil {
+				log.Printf("[LOG] nudge: WRITE ERROR after %d/%d bytes: %v", written, len(full), err)
+				return
+			}
+			written += n
+			time.Sleep(5 * time.Millisecond)
 		}
-		// Brief pause before CR to let the paste buffer flush.
-		time.Sleep(10 * time.Millisecond)
-		_, err = writer.Write([]byte("\r"))
-		if err != nil {
-			log.Printf("[LOG] nudge: WRITE ERROR (CR): %v", err)
-			return
-		}
-		log.Printf("[LOG] nudge: COMPLETE — wrote %d bytes (bracketed paste + CR)", n+1)
+		elapsed := time.Since(start)
+		log.Printf("[LOG] nudge: COMPLETE — wrote %d bytes in %v", written, elapsed)
 	}()
 	return true
 }
@@ -257,7 +256,7 @@ func (h *Hub) HandleTestNudge(w http.ResponseWriter, r *http.Request) {
 	paste := "\x1b[200~" + msg + "\x1b[201~"
 	_, writeErr := writer.Write([]byte(paste))
 	if writeErr == nil {
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 		_, writeErr = writer.Write([]byte("\r"))
 	}
 	full := paste + "\r"
