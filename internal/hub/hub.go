@@ -124,25 +124,65 @@ func (h *Hub) handleNotify(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "ok")
 }
 
-// summaryMessage builds a notification message with source counts.
+// extractHint parses the Raw JSON-RPC notification for a _hint field in params.
+// Returns the hint string, or empty string if not found.
+func extractHint(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	var msg struct {
+		Params struct {
+			Hint string `json:"_hint"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
+		return ""
+	}
+	return msg.Params.Hint
+}
+
+// summaryMessage builds a notification message with source counts and optional hints.
+// When notifications carry _hint metadata (e.g. "dm:alice", "room:General"),
+// the summary includes them so the agent can distinguish message types.
 // Must be called with h.mu held.
 func (h *Hub) summaryMessage() string {
-	counts := make(map[string]int)
-	for _, n := range h.notifications {
-		counts[n.Server]++
-	}
 	total := len(h.notifications)
 
-	// Sort server names for deterministic output.
-	servers := make([]string, 0, len(counts))
-	for s := range counts {
-		servers = append(servers, s)
+	// Per-server: count + collect hints
+	type serverInfo struct {
+		count int
+		hints []string // non-empty hints from Raw payloads
 	}
-	sort.Strings(servers)
+	servers := make(map[string]*serverInfo)
+	for _, n := range h.notifications {
+		si, ok := servers[n.Server]
+		if !ok {
+			si = &serverInfo{}
+			servers[n.Server] = si
+		}
+		si.count++
+		if hint := extractHint(n.Raw); hint != "" {
+			si.hints = append(si.hints, hint)
+		}
+	}
+
+	// Sort server names for deterministic output.
+	serverNames := make([]string, 0, len(servers))
+	for s := range servers {
+		serverNames = append(serverNames, s)
+	}
+	sort.Strings(serverNames)
 
 	var parts []string
-	for _, s := range servers {
-		parts = append(parts, fmt.Sprintf("%s: %d", s, counts[s]))
+	for _, s := range serverNames {
+		si := servers[s]
+		if len(si.hints) > 0 {
+			// Combine all hints for this server (they may already be pre-aggregated)
+			combined := strings.Join(si.hints, ", ")
+			parts = append(parts, fmt.Sprintf("%s: %d — %s", s, si.count, combined))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s: %d", s, si.count))
+		}
 	}
 
 	return fmt.Sprintf("[mcp-notify] %d new notification(s) (%s). Call the get_notifications tool to see them.",

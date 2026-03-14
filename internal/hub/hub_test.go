@@ -102,11 +102,116 @@ func TestStartupNotificationDoesNotBlockLater(t *testing.T) {
 	}
 }
 
+func TestExtractHint(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"with hint", `{"jsonrpc":"2.0","method":"notifications/resources/list_changed","params":{"_hint":"dm:alice"}}`, "dm:alice"},
+		{"no hint", `{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}`, ""},
+		{"no params", `{"jsonrpc":"2.0","method":"notifications/resources/list_changed","params":{}}`, ""},
+		{"empty raw", "", ""},
+		{"invalid json", "not json", ""},
+		{"complex hint", `{"jsonrpc":"2.0","method":"notifications/resources/list_changed","params":{"_hint":"2x dm:alice, room:General"}}`, "2x dm:alice, room:General"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := extractHint(tt.raw); got != tt.want {
+				t.Errorf("extractHint() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSummaryMessageWithHints(t *testing.T) {
+	h := New(nil)
+
+	// Add notification with hint.
+	h.mu.Lock()
+	h.notifications = append(h.notifications, Notification{
+		Server: "matrix-server",
+		Method: "notifications/resources/list_changed",
+		Raw:    `{"jsonrpc":"2.0","method":"notifications/resources/list_changed","params":{"_hint":"dm:alice"}}`,
+	})
+	msg := h.summaryMessage()
+	h.mu.Unlock()
+
+	expected := "[mcp-notify] 1 new notification(s) (matrix-server: 1 — dm:alice). Call the get_notifications tool to see them."
+	if msg != expected {
+		t.Errorf("summaryMessage() =\n  %q\nwant\n  %q", msg, expected)
+	}
+}
+
+func TestSummaryMessageWithoutHints(t *testing.T) {
+	h := New(nil)
+
+	// Add notification without hint (backward compatibility).
+	h.mu.Lock()
+	h.notifications = append(h.notifications, Notification{
+		Server: "matrix-server",
+		Method: "notifications/resources/list_changed",
+		Raw:    `{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}`,
+	})
+	msg := h.summaryMessage()
+	h.mu.Unlock()
+
+	expected := "[mcp-notify] 1 new notification(s) (matrix-server: 1). Call the get_notifications tool to see them."
+	if msg != expected {
+		t.Errorf("summaryMessage() =\n  %q\nwant\n  %q", msg, expected)
+	}
+}
+
+func TestSummaryMessageMixedServers(t *testing.T) {
+	h := New(nil)
+
+	h.mu.Lock()
+	h.notifications = append(h.notifications,
+		Notification{
+			Server: "matrix-server",
+			Method: "notifications/resources/list_changed",
+			Raw:    `{"jsonrpc":"2.0","method":"notifications/resources/list_changed","params":{"_hint":"dm:alice"}}`,
+		},
+		Notification{
+			Server: "matrix-server",
+			Method: "notifications/resources/list_changed",
+			Raw:    `{"jsonrpc":"2.0","method":"notifications/resources/list_changed","params":{"_hint":"room:General"}}`,
+		},
+		Notification{
+			Server: "other-server",
+			Method: "notifications/resources/list_changed",
+		},
+	)
+	msg := h.summaryMessage()
+	h.mu.Unlock()
+
+	expected := "[mcp-notify] 3 new notification(s) (matrix-server: 2 — dm:alice, room:General, other-server: 1). Call the get_notifications tool to see them."
+	if msg != expected {
+		t.Errorf("summaryMessage() =\n  %q\nwant\n  %q", msg, expected)
+	}
+}
+
 func addNotification(t *testing.T, h *Hub, server, method string) {
 	t.Helper()
 	form := url.Values{
 		"server": {server},
 		"method": {method},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/notify", bytes.NewBufferString(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.HandleNotify(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("notify returned %d", w.Code)
+	}
+}
+
+func addNotificationWithRaw(t *testing.T, h *Hub, server, method, raw string) {
+	t.Helper()
+	form := url.Values{
+		"server": {server},
+		"method": {method},
+		"raw":    {raw},
 	}
 	req := httptest.NewRequest(http.MethodPost, "/notify", bytes.NewBufferString(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
