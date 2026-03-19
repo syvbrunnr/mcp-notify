@@ -189,11 +189,10 @@ func (h *Hub) summaryMessage() string {
 		total, strings.Join(parts, ", "))
 }
 
-// nudge delivers a notification message to Claude's stdin using bracketed paste.
-// Bracketed paste (\e[200~ ... \e[201~) causes the TUI's key parser to treat
-// the entire message as a single paste event, bypassing per-character input
-// filters (voice detection, key repeat detection) that can intercept rapid
-// same-character sequences from char-by-char delivery.
+// nudge delivers a notification message to Claude's stdin char-by-char.
+// Char-by-char delivery (5ms between chars) avoids bracketed paste mode issues
+// where the TUI can get stuck in paste-collection state, breaking subsequent
+// Enter key presses. The final \r submits the notification message.
 // Returns true if the nudge was initiated (writer available), false if skipped.
 func (h *Hub) nudge() bool {
 	h.mu.Lock()
@@ -209,19 +208,20 @@ func (h *Hub) nudge() bool {
 	h.mu.Unlock()
 
 	go func() {
-		paste := "\x1b[200~" + msg + "\x1b[201~"
-		_, err := writer.Write([]byte(paste))
-		if err != nil {
-			log.Printf("[LOG] nudge: WRITE ERROR: %v", err)
-			return
+		full := msg + "\r"
+		written := 0
+		start := time.Now()
+		for _, c := range []byte(full) {
+			n, err := writer.Write([]byte{c})
+			if err != nil {
+				log.Printf("[LOG] nudge: WRITE ERROR after %d/%d bytes: %v", written, len(full), err)
+				return
+			}
+			written += n
+			time.Sleep(5 * time.Millisecond)
 		}
-		time.Sleep(100 * time.Millisecond)
-		_, err = writer.Write([]byte("\r"))
-		if err != nil {
-			log.Printf("[LOG] nudge: WRITE ERROR (\\r): %v", err)
-			return
-		}
-		log.Printf("[LOG] nudge: COMPLETE — wrote %d bytes", len(paste)+1)
+		elapsed := time.Since(start)
+		log.Printf("[LOG] nudge: COMPLETE — wrote %d bytes in %v", written, elapsed)
 	}()
 	return true
 }
