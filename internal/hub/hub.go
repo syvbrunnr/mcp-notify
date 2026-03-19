@@ -29,7 +29,7 @@ type Hub struct {
 }
 
 const (
-	nudgeCooldown = 60 * time.Second // minimum interval between nudges
+	nudgeCooldown = 15 * time.Second // minimum interval between nudges
 )
 
 // New creates a hub that injects nudge messages into the given writer.
@@ -209,20 +209,19 @@ func (h *Hub) nudge() bool {
 	h.mu.Unlock()
 
 	go func() {
-		full := msg + "\r"
-		written := 0
-		start := time.Now()
-		for _, c := range []byte(full) {
-			n, err := writer.Write([]byte{c})
-			if err != nil {
-				log.Printf("[LOG] nudge: WRITE ERROR after %d/%d bytes: %v", written, len(full), err)
-				return
-			}
-			written += n
-			time.Sleep(5 * time.Millisecond)
+		paste := "\x1b[200~" + msg + "\x1b[201~"
+		_, err := writer.Write([]byte(paste))
+		if err != nil {
+			log.Printf("[LOG] nudge: WRITE ERROR: %v", err)
+			return
 		}
-		elapsed := time.Since(start)
-		log.Printf("[LOG] nudge: COMPLETE — wrote %d bytes in %v", written, elapsed)
+		time.Sleep(100 * time.Millisecond)
+		_, err = writer.Write([]byte("\r"))
+		if err != nil {
+			log.Printf("[LOG] nudge: WRITE ERROR (\\r): %v", err)
+			return
+		}
+		log.Printf("[LOG] nudge: COMPLETE — wrote %d bytes", len(paste)+1)
 	}()
 	return true
 }
