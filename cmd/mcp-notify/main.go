@@ -98,11 +98,16 @@ func (pm *processManager) startClaude() error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	// Token rotation: read active token if available.
-	token := readActiveToken()
-	if token != "" {
-		cmd.Env = buildCleanEnv(token)
-		log.Printf("token source: %s", tokenSource())
+	// Token rotation: only inject CLAUDE_CODE_OAUTH_TOKEN if it was already
+	// set in the parent environment. The token file can override the value
+	// (for rotation), but we don't force-create the env var when it wasn't
+	// there — that would override credentials.json auth.
+	if os.Getenv("CLAUDE_CODE_OAUTH_TOKEN") != "" {
+		token := readActiveToken()
+		if token != "" {
+			cmd.Env = buildCleanEnv(token)
+			log.Printf("token source: %s", tokenSource())
+		}
 	}
 
 	// Always use PTY — needed for notification nudge injection.
