@@ -35,7 +35,10 @@ const (
 	defaultPort = 9781
 	tokenFile   = ".claude-active-token" // relative to DATA_DIR
 
-	stdinBufSize          = 4096
+	stdinBufSize = 4096
+
+	defaultIdleTimeout = 0 // disabled by default
+	defaultIdleMessage = "[idle-detector] No terminal activity detected. This is an automated signal, NOT a user response. Resume autonomous work."
 	restartMsgDelay       = 5 * time.Second
 	restartFlushDelay     = 10 * time.Second
 	restartSignalInterval = 5 * time.Second
@@ -95,7 +98,7 @@ func (pm *processManager) startClaude() error {
 	log.Printf("starting claude with args: %v", args)
 
 	cmd := exec.Command("claude", args...)
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = &activityWriter{inner: os.Stdout, hub: pm.hub}
 	cmd.Stderr = os.Stderr
 
 	// Token rotation: only inject CLAUDE_CODE_OAUTH_TOKEN if it was already
@@ -174,6 +177,7 @@ func (pm *processManager) startClaude() error {
 			for {
 				n, err := os.Stdin.Read(buf)
 				if n > 0 {
+					pm.hub.RecordActivity()
 					pm.stdinMu.Lock()
 					if pm.ptmx != nil {
 						pm.ptmx.Write(buf[:n])
@@ -294,6 +298,18 @@ func detectSessionID() string {
 		return fi.ModTime().After(fj.ModTime())
 	})
 	return strings.TrimSuffix(filepath.Base(matches[0]), ".jsonl")
+}
+
+// activityWriter wraps a writer and records activity on every write.
+// Used to tee stdout through the hub's activity tracker.
+type activityWriter struct {
+	inner io.Writer
+	hub   *hub.Hub
+}
+
+func (aw *activityWriter) Write(p []byte) (int, error) {
+	aw.hub.RecordActivity()
+	return aw.inner.Write(p)
 }
 
 // syncWriter synchronizes writes to the PTY master fd.
@@ -536,6 +552,8 @@ func main() {
 	port := flag.Int("port", defaultPort, "Hub port")
 	proxyBin := flag.String("proxy-bin", "", "Path to mcp-notify-proxy binary")
 	skipPerms := flag.Bool("skip-permissions", false, "Pass --dangerously-skip-permissions to Claude")
+	idleTimeout := flag.Duration("idle-timeout", defaultIdleTimeout, "Inject wake-up after this duration of no terminal activity (0 = disabled, e.g. 10s)")
+	idleMsg := flag.String("idle-message", defaultIdleMessage, "Message to inject when idle timeout fires")
 	flag.Parse()
 
 	claudeArgs := flag.Args()
@@ -560,6 +578,11 @@ func main() {
 
 	// Create hub (writer set later when Claude starts).
 	h := hub.New(nil)
+
+	// Start idle detector if configured.
+	if *idleTimeout > 0 {
+		h.StartIdleDetector(*idleTimeout, *idleMsg)
+	}
 
 	// Create process manager.
 	pm := newProcessManager(rewrittenConfig, claudeArgs, h, *skipPerms)

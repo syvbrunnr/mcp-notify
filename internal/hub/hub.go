@@ -26,6 +26,12 @@ type Hub struct {
 	notifications []Notification
 	lastNudgeAt   time.Time // when the last nudge was sent (zero if never)
 	stdinWriter   io.Writer // writes to Claude's stdin (PTY master or pipe)
+
+	// Idle detection: tracks last terminal activity (stdin or stdout).
+	lastActivity  time.Time     // updated by RecordActivity()
+	idleTimeout   time.Duration // inject wake-up after this much silence (0 = disabled)
+	idleMessage   string        // message to inject on idle
+	idleRunning   bool          // whether idle detector goroutine is active
 }
 
 const (
@@ -35,8 +41,81 @@ const (
 // New creates a hub that injects nudge messages into the given writer.
 func New(stdinWriter io.Writer) *Hub {
 	return &Hub{
-		stdinWriter: stdinWriter,
+		stdinWriter:  stdinWriter,
+		lastActivity: time.Now(),
 	}
+}
+
+// RecordActivity updates the last-activity timestamp. Call this from both
+// the stdin reader (user typing) and stdout tee (Claude output) to track
+// any terminal activity that indicates the session is not idle.
+func (h *Hub) RecordActivity() {
+	h.mu.Lock()
+	h.lastActivity = time.Now()
+	h.mu.Unlock()
+}
+
+// StartIdleDetector launches a goroutine that injects a wake-up message
+// when no terminal activity (stdin or stdout) has occurred for the given
+// timeout. The message is clearly marked as automated so Claude doesn't
+// interpret it as a user response. Safe to call multiple times — only
+// the first call starts the goroutine.
+func (h *Hub) StartIdleDetector(timeout time.Duration, message string) {
+	h.mu.Lock()
+	if h.idleRunning {
+		h.mu.Unlock()
+		return
+	}
+	h.idleRunning = true
+	h.idleTimeout = timeout
+	h.idleMessage = message
+	h.lastActivity = time.Now()
+	h.mu.Unlock()
+
+	log.Printf("[LOG] idle detector started (timeout=%v)", timeout)
+
+	go func() {
+		for {
+			time.Sleep(1 * time.Second)
+
+			h.mu.Lock()
+			idle := time.Since(h.lastActivity)
+			timeout := h.idleTimeout
+			writer := h.stdinWriter
+			msg := h.idleMessage
+			h.mu.Unlock()
+
+			if timeout == 0 || writer == nil {
+				continue
+			}
+
+			if idle < timeout {
+				continue
+			}
+
+			log.Printf("[LOG] idle detector: %v idle, injecting wake-up", idle.Round(time.Second))
+
+			go func() {
+				full := msg + "\r"
+				for _, c := range []byte(full) {
+					h.mu.Lock()
+					w := h.stdinWriter
+					h.mu.Unlock()
+					if w == nil {
+						return
+					}
+					w.Write([]byte{c})
+					time.Sleep(5 * time.Millisecond)
+				}
+				log.Printf("[LOG] idle detector: wake-up injected (%d bytes)", len(full))
+			}()
+
+			// Reset activity so we don't spam.
+			h.mu.Lock()
+			h.lastActivity = time.Now()
+			h.mu.Unlock()
+		}
+	}()
 }
 
 // HandleNotify is the HTTP handler for receiving notifications from proxies.
