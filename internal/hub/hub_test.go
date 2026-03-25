@@ -206,6 +206,43 @@ func addNotification(t *testing.T, h *Hub, server, method string) {
 	}
 }
 
+func TestIdleDetectorBackoff(t *testing.T) {
+	var buf bytes.Buffer
+	h := New(&buf)
+
+	// Start idle detector with 2s base timeout (must exceed the 1s poll loop).
+	h.StartIdleDetector(2*time.Second, "[test] wake up")
+
+	// Wait for first wake-up (2s timeout + 1s poll + char injection).
+	time.Sleep(4 * time.Second)
+	if buf.Len() == 0 {
+		t.Fatal("expected first wake-up")
+	}
+
+	// The timeout should now be 3s (2s * 1.5). idleWasSynthetic should be true.
+	h.mu.Lock()
+	if !h.idleWasSynthetic {
+		t.Error("expected idleWasSynthetic=true after synthetic wake-up")
+	}
+	cur := h.idleTimeoutCur
+	h.mu.Unlock()
+	if cur != 3*time.Second {
+		t.Errorf("expected timeout 3s after backoff, got %v", cur)
+	}
+
+	// Simulate real activity — should reset backoff.
+	h.RecordActivity()
+	h.mu.Lock()
+	if h.idleWasSynthetic {
+		t.Error("expected idleWasSynthetic=false after RecordActivity")
+	}
+	cur = h.idleTimeoutCur
+	h.mu.Unlock()
+	if cur != 2*time.Second {
+		t.Errorf("expected timeout reset to 2s, got %v", cur)
+	}
+}
+
 func addNotificationWithRaw(t *testing.T, h *Hub, server, method, raw string) {
 	t.Helper()
 	form := url.Values{
