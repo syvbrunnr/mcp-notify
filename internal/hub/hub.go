@@ -28,10 +28,13 @@ type Hub struct {
 	stdinWriter   io.Writer // writes to Claude's stdin (PTY master or pipe)
 
 	// Idle detection: tracks last terminal activity (stdin or stdout).
-	lastActivity  time.Time     // updated by RecordActivity()
-	idleTimeout   time.Duration // inject wake-up after this much silence (0 = disabled)
-	idleMessage   string        // message to inject on idle
-	idleRunning   bool          // whether idle detector goroutine is active
+	lastActivity    time.Time     // updated by RecordActivity()
+	idleTimeout     time.Duration // BASE timeout (configured via flag)
+	idleTimeoutCur  time.Duration // CURRENT timeout (increases with backoff)
+	idleTimeoutMax  time.Duration // maximum backoff cap (default 120s)
+	idleMessage     string        // message to inject on idle
+	idleRunning     bool          // whether idle detector goroutine is active
+	idleWasSynthetic bool         // true if last activity was from idle injection (not real)
 }
 
 const (
@@ -49,9 +52,17 @@ func New(stdinWriter io.Writer) *Hub {
 // RecordActivity updates the last-activity timestamp. Call this from both
 // the stdin reader (user typing) and stdout tee (Claude output) to track
 // any terminal activity that indicates the session is not idle.
+// Also resets the exponential backoff — real activity means the session
+// is productive again, so the timeout should return to base.
 func (h *Hub) RecordActivity() {
 	h.mu.Lock()
 	h.lastActivity = time.Now()
+	if h.idleWasSynthetic && h.idleTimeout > 0 {
+		// Real activity after a synthetic wake-up: reset backoff
+		h.idleTimeoutCur = h.idleTimeout
+		h.idleWasSynthetic = false
+		log.Printf("[LOG] idle detector: real activity detected, timeout reset to %v", h.idleTimeout)
+	}
 	h.mu.Unlock()
 }
 
@@ -68,11 +79,13 @@ func (h *Hub) StartIdleDetector(timeout time.Duration, message string) {
 	}
 	h.idleRunning = true
 	h.idleTimeout = timeout
+	h.idleTimeoutCur = timeout
+	h.idleTimeoutMax = 120 * time.Second // 2 minute cap
 	h.idleMessage = message
 	h.lastActivity = time.Now()
 	h.mu.Unlock()
 
-	log.Printf("[LOG] idle detector started (timeout=%v)", timeout)
+	log.Printf("[LOG] idle detector started (timeout=%v, max=%v)", timeout, 120*time.Second)
 
 	go func() {
 		for {
@@ -80,20 +93,20 @@ func (h *Hub) StartIdleDetector(timeout time.Duration, message string) {
 
 			h.mu.Lock()
 			idle := time.Since(h.lastActivity)
-			timeout := h.idleTimeout
+			curTimeout := h.idleTimeoutCur
 			writer := h.stdinWriter
 			msg := h.idleMessage
 			h.mu.Unlock()
 
-			if timeout == 0 || writer == nil {
+			if curTimeout == 0 || writer == nil {
 				continue
 			}
 
-			if idle < timeout {
+			if idle < curTimeout {
 				continue
 			}
 
-			log.Printf("[LOG] idle detector: %v idle, injecting wake-up", idle.Round(time.Second))
+			log.Printf("[LOG] idle detector: %v idle (timeout=%v), injecting wake-up", idle.Round(time.Second), curTimeout.Round(time.Second))
 
 			go func() {
 				full := msg + "\r"
@@ -110,9 +123,20 @@ func (h *Hub) StartIdleDetector(timeout time.Duration, message string) {
 				log.Printf("[LOG] idle detector: wake-up injected (%d bytes)", len(full))
 			}()
 
-			// Reset activity so we don't spam.
+			// Exponential backoff: increase timeout by 1.5x after each
+			// synthetic wake-up. Resets when RecordActivity sees real
+			// terminal output. Caps at idleTimeoutMax (120s).
 			h.mu.Lock()
 			h.lastActivity = time.Now()
+			h.idleWasSynthetic = true
+			newTimeout := time.Duration(float64(h.idleTimeoutCur) * 1.5)
+			if newTimeout > h.idleTimeoutMax {
+				newTimeout = h.idleTimeoutMax
+			}
+			if newTimeout != h.idleTimeoutCur {
+				log.Printf("[LOG] idle detector: backoff %v -> %v", h.idleTimeoutCur.Round(time.Second), newTimeout.Round(time.Second))
+			}
+			h.idleTimeoutCur = newTimeout
 			h.mu.Unlock()
 		}
 	}()
