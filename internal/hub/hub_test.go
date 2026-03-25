@@ -243,6 +243,116 @@ func TestIdleDetectorBackoff(t *testing.T) {
 	}
 }
 
+func TestIdleDetectorBackoffCapsAtMax(t *testing.T) {
+	var buf bytes.Buffer
+	h := New(&buf)
+
+	// Start with 2s base. Max is 120s.
+	h.StartIdleDetector(2*time.Second, "[test] wake up")
+
+	// Manually simulate many backoff steps without waiting.
+	h.mu.Lock()
+	h.idleTimeoutCur = 100 * time.Second // near max
+	h.mu.Unlock()
+
+	// Simulate one more synthetic wake-up cycle.
+	h.mu.Lock()
+	newTimeout := time.Duration(float64(h.idleTimeoutCur) * 1.5) // 150s
+	if newTimeout > h.idleTimeoutMax {
+		newTimeout = h.idleTimeoutMax // should cap at 120s
+	}
+	h.idleTimeoutCur = newTimeout
+	h.mu.Unlock()
+
+	h.mu.Lock()
+	cur := h.idleTimeoutCur
+	h.mu.Unlock()
+	if cur != 120*time.Second {
+		t.Errorf("expected timeout capped at 120s, got %v", cur)
+	}
+}
+
+func TestIdleDetectorMultipleResets(t *testing.T) {
+	var buf bytes.Buffer
+	h := New(&buf)
+
+	h.StartIdleDetector(2*time.Second, "[test] wake up")
+
+	// Simulate backoff state.
+	h.mu.Lock()
+	h.idleTimeoutCur = 30 * time.Second
+	h.idleWasSynthetic = true
+	h.mu.Unlock()
+
+	// First reset.
+	h.RecordActivity()
+	h.mu.Lock()
+	if h.idleTimeoutCur != 2*time.Second {
+		t.Errorf("first reset: expected 2s, got %v", h.idleTimeoutCur)
+	}
+	h.mu.Unlock()
+
+	// Simulate more backoff.
+	h.mu.Lock()
+	h.idleTimeoutCur = 45 * time.Second
+	h.idleWasSynthetic = true
+	h.mu.Unlock()
+
+	// Second reset.
+	h.RecordActivity()
+	h.mu.Lock()
+	if h.idleTimeoutCur != 2*time.Second {
+		t.Errorf("second reset: expected 2s, got %v", h.idleTimeoutCur)
+	}
+	if h.idleWasSynthetic {
+		t.Error("expected idleWasSynthetic=false after second reset")
+	}
+	h.mu.Unlock()
+}
+
+func TestIdleDetectorDoesNotResetOnNonSynthetic(t *testing.T) {
+	var buf bytes.Buffer
+	h := New(&buf)
+
+	h.StartIdleDetector(2*time.Second, "[test] wake up")
+
+	// Set a backed-off timeout but NOT synthetic (real activity hasn't
+	// been preceded by a synthetic wake-up).
+	h.mu.Lock()
+	h.idleTimeoutCur = 10 * time.Second
+	h.idleWasSynthetic = false
+	h.mu.Unlock()
+
+	// RecordActivity should NOT reset since idleWasSynthetic is false.
+	h.RecordActivity()
+	h.mu.Lock()
+	cur := h.idleTimeoutCur
+	h.mu.Unlock()
+	if cur != 10*time.Second {
+		t.Errorf("expected timeout unchanged at 10s (not synthetic), got %v", cur)
+	}
+}
+
+func TestIdleDetectorStartOnlyOnce(t *testing.T) {
+	var buf bytes.Buffer
+	h := New(&buf)
+
+	h.StartIdleDetector(2*time.Second, "[test] first")
+	h.StartIdleDetector(5*time.Second, "[test] second") // should be ignored
+
+	h.mu.Lock()
+	timeout := h.idleTimeout
+	msg := h.idleMessage
+	h.mu.Unlock()
+
+	if timeout != 2*time.Second {
+		t.Errorf("expected base timeout 2s from first call, got %v", timeout)
+	}
+	if msg != "[test] first" {
+		t.Errorf("expected message from first call, got %q", msg)
+	}
+}
+
 func addNotificationWithRaw(t *testing.T, h *Hub, server, method, raw string) {
 	t.Helper()
 	form := url.Values{
