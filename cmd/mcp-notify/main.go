@@ -30,7 +30,7 @@ const (
 	stdinBufSize = 4096
 
 	defaultIdleTimeout = 0 // disabled by default
-	defaultIdleMessage = "[idle-detector] No terminal activity detected. This is an automated signal, NOT a user response. Resume autonomous work."
+	defaultIdleMessage = "[idle-detector] No terminal activity detected. This is an automated signal, NOT a user response. Resume autonomous work. Consider whether compaction would help you refocus — work is never complete."
 	restartMsgDelay       = 5 * time.Second
 	restartFlushDelay     = 10 * time.Second
 	restartSignalInterval = 5 * time.Second
